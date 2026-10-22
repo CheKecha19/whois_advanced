@@ -1,434 +1,228 @@
+"""IP enrichment and Excel reporting. Run python main.py --help."""
+
+import argparse
+from datetime import datetime, timezone
+import ipaddress
+import math
+from pathlib import Path
+import sys
+import time
+
 import pandas as pd
 import requests
-import time
-import os
-import re
-from datetime import datetime
-import json
+
+__version__ = "1.1.0"
+MISSING = "N/A"
+FIELDS = ["ip", "organization", "country", "city", "region", "netname", "asn",
+          "asn_description", "isp", "postal_code", "timezone", "data_source",
+          "success", "request_status", "error_type", "error_message"]
+PROVIDERS = (
+    ("ipapi.co", "https://ipapi.co/{ip}/json/", {"organization": "org", "country": "country_name"}),
+    ("ipwhois.app", "https://ipwhois.app/json/{ip}", {"organization": "org", "country": "country"}),
+)
+
 
 def read_ips_from_txt(file_path):
-    """
-    Читает IP-адреса из текстового файла
-    """
-    ips = []
+    """Canonicalize IPv4/IPv6, ignore comments, preserve first-seen order."""
+    addresses = {}
+    with open(file_path, encoding="utf-8-sig") as source:
+        for number, line in enumerate(source, 1):
+            value = line.split("#", 1)[0].strip()
+            if not value:
+                continue
+            try:
+                address = ipaddress.ip_address(value)
+                if "%" in value:
+                    raise ValueError("Scoped IPv6 is not supported")
+                addresses[str(address)] = None
+            except ValueError:
+                print(f"Строка {number}: неверный IP {value!r}", file=sys.stderr)
+    return list(addresses)
+
+
+def clean(value):
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return MISSING
+    value = " ".join(str(value).split())
+    return MISSING if value.lower() in ("", "none", "null", "n/a") else value
+
+
+def get_comprehensive_whois_info(ip_address, session=None, timeout=10, retries=2, backoff=1):
+    """Try providers in order; retry transient failures with bounded backoff."""
+    address = ipaddress.ip_address(ip_address)
+    result = dict.fromkeys(FIELDS, MISSING)
+    result.update(ip=str(address), success="No", request_status="failed",
+                  error_type="no_data", error_message="", data_source=MISSING)
+    if not address.is_global or address.is_multicast:
+        result.update(request_status="skipped", error_type="non_public_ip",
+                      error_message="Для локального/служебного IP публичные API не вызываются")
+        return result
+    owned = session is None
+    session = session or requests.Session()
+    errors = []
     try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            for line in file:
-                line = line.strip()
-                # Проверяем, что строка похожа на IP-адрес
-                if line and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', line):
-                    ips.append(line)
-                elif line:
-                    print(f"⚠️ Пропущена строка (не IP-адрес): {line}")
-        
-        print(f"📖 Прочитано IP-адресов из файла: {len(ips)}")
-        return ips
-        
-    except Exception as e:
-        print(f"❌ Ошибка при чтении файла {file_path}: {e}")
-        return []
+        for host, template, mapping in PROVIDERS:
+            for attempt in range(retries + 1):
+                retryable, retry_after = False, None
+                status_label = "failed"
+                try:
+                    with session.get(template.format(ip=address), timeout=timeout) as response:
+                        status = response.status_code
+                        status_label = f"HTTP {status}"
+                        if status != 200:
+                            kind, message = f"http_{status}", status_label
+                            retryable = status == 429 or status in (500, 502, 503, 504)
+                            try:
+                                seconds = float(response.headers.get("Retry-After", "nan"))
+                                if math.isfinite(seconds):
+                                    retry_after = min(60, max(0, seconds))
+                            except ValueError:
+                                pass
+                        else:
+                            data = response.json()
+                            if not isinstance(data, dict) or not data:
+                                kind, message = "invalid_response", "Ожидался непустой JSON-объект"
+                            elif data.get("error") or data.get("reserved") or data.get("success") is False:
+                                kind, message = "api_error", clean(data.get("reason") or data.get("message") or "API отклонил запрос")
+                            else:
+                                parsed = {field: clean(data.get(mapping.get(field, field)))
+                                          for field in ("organization", "country", "city", "region", "asn", "isp", "timezone")}
+                                parsed["postal_code"] = clean(data.get("postal"))
+                                if any(parsed[k] != MISSING for k in ("organization", "country", "asn", "isp")):
+                                    result.update(parsed)
+                                    result.update(success="Yes", request_status="HTTP 200", data_source=host,
+                                                  error_type="", error_message="; ".join(errors))
+                                    return result
+                                kind, message = "no_data", "Ответ не содержит сетевых или географических данных"
+                except requests.Timeout:
+                    kind, message, retryable = "timeout", "Превышен таймаут", True
+                except requests.ConnectionError:
+                    kind, message, retryable = "connection_error", "Ошибка соединения/прокси/TLS", True
+                except ValueError:
+                    kind, message = "invalid_json", "Некорректный JSON"
+                except requests.RequestException as error:
+                    kind, message = "request_error", type(error).__name__
+                errors.append(f"{host} (попытка {attempt + 1}): {message}")
+                result.update(error_type=kind, request_status=status_label if kind.startswith("http_") else kind)
+                if not retryable or attempt == retries:
+                    break
+                time.sleep(retry_after if retry_after is not None else min(backoff * 2 ** attempt, 60))
+        result["error_message"] = "; ".join(errors)
+        return result
+    finally:
+        if owned:
+            session.close()
 
-def get_whois_via_api_primary(ip_address):
-    """
-    Основной метод через API с приоритетом
-    """
-    apis = [
-        # Основные API
-        {
-            'url': f"http://ipapi.co/{ip_address}/json/",
-            'fields': {
-                'org': 'org',
-                'country': 'country_name',
-                'city': 'city',
-                'region': 'region',
-                'asn': 'asn',
-                'isp': 'isp',
-                'postal': 'postal',
-                'timezone': 'timezone'
-            }
-        },
-        {
-            'url': f"http://ipwhois.app/json/{ip_address}",
-            'fields': {
-                'org': 'org',
-                'country': 'country',
-                'city': 'city',
-                'region': 'region',
-                'asn': 'asn',
-                'isp': 'isp',
-                'postal': 'postal',
-                'timezone': 'timezone'
-            }
-        }
-    ]
-    
-    for api in apis:
-        try:
-            response = requests.get(api['url'], timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                
-                # Проверяем, что данные валидны
-                if data and not data.get('error') and not data.get('reserved'):
-                    result = {}
-                    for our_key, api_key in api['fields'].items():
-                        result[our_key] = data.get(api_key, 'N/A')
-                    
-                    # Дополнительная информация
-                    result['ip'] = ip_address
-                    result['source_api'] = api['url'].split('/')[2]  # Доменное имя API
-                    
-                    print(f"    ✓ Данные получены от {result['source_api']}")
-                    return result
-                    
-        except Exception as e:
-            continue
-    
-    return None
 
-def extract_network_info(org, asn, isp):
-    """
-    Извлекает сетевую информацию из доступных данных
-    """
-    netname = 'N/A'
-    asn_description = 'N/A'
-    
-    # Пытаемся создать осмысленные netname и описания
-    if org and org != 'N/A':
-        # Создаем netname из названия организации
-        netname = re.sub(r'[^a-zA-Z0-9]', '', org.upper())[:20]
-        asn_description = org
-    
-    elif isp and isp != 'N/A':
-        netname = re.sub(r'[^a-zA-Z0-9]', '', isp.upper())[:20]
-        asn_description = isp
-    
-    elif asn and asn != 'N/A':
-        netname = f"AS{asn}"
-        asn_description = f"AS{asn}"
-    
-    return netname, asn_description
+def excel_text(value):
+    """Keep external values as text rather than executable spreadsheet formulas."""
+    if isinstance(value, str):
+        value = "".join(c for c in value if ord(c) >= 32 or c in "\n\r\t")
+        return "'" + value if value.startswith(("=", "+", "-", "@")) else value
+    return value
 
-def get_comprehensive_whois_info(ip_address):
-    """
-    Основная функция получения WHOIS информации
-    """
-    print(f"  📡 Запрос данных для {ip_address}...")
-    
-    # Метод 1: Основные API
-    api_data = get_whois_via_api_primary(ip_address)
-    
-    # Если основные API не сработали
-    if not api_data:
-        print(f"  🔄 Основные API не ответили")
-        api_data = {
-            'ip': ip_address,
-            'org': 'N/A',
-            'country': 'N/A',
-            'city': 'N/A',
-            'region': 'N/A',
-            'asn': 'N/A',
-            'isp': 'N/A',
-            'source_api': 'no_data'
-        }
-    
-    # Извлекаем сетевую информацию
-    netname, asn_description = extract_network_info(
-        api_data.get('org', 'N/A'),
-        api_data.get('asn', 'N/A'),
-        api_data.get('isp', 'N/A')
-    )
-    
-    # Формируем полный результат
-    result = {
-        'ip': ip_address,
-        
-        # Основная информация
-        'organization': api_data.get('org', 'N/A'),
-        'country': api_data.get('country', 'N/A'),
-        'city': api_data.get('city', 'N/A'),
-        'region': api_data.get('region', 'N/A'),
-        
-        # Сетевая информация
-        'netname': netname,
-        'asn': api_data.get('asn', 'N/A'),
-        'asn_description': asn_description,
-        'isp': api_data.get('isp', 'N/A'),
-        
-        # Дополнительная информация
-        'postal_code': api_data.get('postal', 'N/A'),
-        'timezone': api_data.get('timezone', 'N/A'),
-        
-        # Метод получения
-        'data_source': api_data.get('source_api', 'multiple_apis'),
-        'success': 'Yes' if api_data and api_data.get('org') != 'N/A' else 'No'
-    }
-    
-    # Очистка данных
-    for key in result:
-        if isinstance(result[key], str):
-            result[key] = re.sub(r'\s+', ' ', result[key]).strip()
-            if result[key] in ['', 'None', 'null']:
-                result[key] = 'N/A'
-    
-    return result
 
-def save_to_single_excel(whois_results, output_path):
-    """
-    Сохраняет все данные в один Excel файл с несколькими вкладками
-    """
+def save_to_single_excel(whois_results, output_path, started_at=None, ended_at=None, overwrite=False):
+    """Always write six sheets, with real timing and unknowns excluded from counts."""
+    started_at = started_at or datetime.now(timezone.utc)
+    ended_at = ended_at or datetime.now(timezone.utc)
+    frame = pd.DataFrame(whois_results, columns=FIELDS).fillna(MISSING)
+    successful = frame[frame["success"] == "Yes"]
+    sheets = {"Все IP-адреса": frame}
+    for name, key in (("По организациям", "organization"), ("По странам", "country"), ("По ASN", "asn")):
+        valid = frame[frame[key] != MISSING]
+        aggregations = {"ip": "count"}
+        for column in ("organization", "country", "asn"):
+            if column != key:
+                aggregations[column] = lambda values: ", ".join(dict.fromkeys(v for v in values if v != MISSING))
+        sheets[name] = (valid.groupby(key, sort=False).agg(aggregations)
+                        .rename(columns={"ip": "count_ips"}).reset_index()
+                        .sort_values("count_ips", ascending=False))
+    sheets["Успешные запросы"] = successful
+    sheets["Сводка"] = pd.DataFrame({
+        "Метрика": ["Всего обработано IP-адресов", "Успешных запросов", "Процент успешных запросов",
+                    "Уникальных организаций", "Уникальных стран", "Уникальных ASN",
+                    "Время начала (UTC)", "Время окончания (UTC)", "Длительность (сек.)"],
+        "Значение": [len(frame), len(successful), f"{len(successful) / len(frame) * 100:.1f}%" if len(frame) else "0.0%",
+                     *[frame.loc[frame[k] != MISSING, k].nunique() for k in ("organization", "country", "asn")],
+                     started_at.isoformat(), ended_at.isoformat(), (ended_at - started_at).total_seconds()],
+    })
+    with open(output_path, "wb" if overwrite else "xb") as target:
+        with pd.ExcelWriter(target, engine="openpyxl") as writer:
+            for name, data in sheets.items():
+                data.map(excel_text).to_excel(writer, sheet_name=name, index=False)
+                sheet = writer.sheets[name]
+                sheet.freeze_panes = "A2"
+                sheet.auto_filter.ref = sheet.dimensions
+                for column in sheet.columns:
+                    width = min(65, max(15, max(len(str(c.value or "")) for c in column) + 2))
+                    sheet.column_dimensions[column[0].column_letter].width = width
+    return True
+
+
+def positive_float(value):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("ожидалось конечное число > 0")
+    return number
+
+
+def nonnegative_float(value):
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("ожидалось конечное число >= 0")
+    return number
+
+
+def nonnegative_int(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("ожидалось целое число >= 0")
+    return number
+
+
+def main(argv=None):
+    directory = Path(__file__).resolve().parent
+    parser = argparse.ArgumentParser(description="Сбор данных о публичных IPv4/IPv6 и экспорт в Excel")
+    parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument("--input", type=Path, default=directory / "ip_list.txt")
+    parser.add_argument("--output", type=Path, help="Путь к Excel-отчёту (по умолчанию — имя с UTC-временем)")
+    parser.add_argument("--overwrite", action="store_true", help="Разрешить замену существующего отчёта")
+    parser.add_argument("--timeout", type=positive_float, default=10)
+    parser.add_argument("--delay", type=nonnegative_float, default=1)
+    parser.add_argument("--retries", type=nonnegative_int, default=2, help="Повторы после первого запроса")
+    args = parser.parse_args(argv)
+    started = datetime.now(timezone.utc)
+    output = args.output or directory / f"WHOIS_Analysis_Report_{started:%Y%m%d_%H%M%S_%f}.xlsx"
+    if output.resolve() == args.input.resolve():
+        print("Входной файл и отчёт должны иметь разные пути", file=sys.stderr)
+        return 1
+    if output.exists() and not args.overwrite:
+        print(f"Отчёт уже существует: {output}. Выберите другое имя или --overwrite", file=sys.stderr)
+        return 1
     try:
-        # Создаем основной DataFrame
-        main_df = pd.DataFrame(whois_results)
-        
-        # Создаем Excel writer объект
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            
-            # 📊 ВКЛАДКА 1: Все результаты
-            main_df.to_excel(writer, sheet_name='Все IP-адреса', index=False)
-            worksheet_main = writer.sheets['Все IP-адреса']
-            
-            # Настраиваем ширину колонок для основной вкладки
-            column_widths_main = {
-                'A': 15,  # IP
-                'B': 35,  # Organization
-                'C': 15,  # Country
-                'D': 15,  # City
-                'E': 15,  # Region
-                'F': 20,  # Netname
-                'G': 10,  # ASN
-                'H': 35,  # ASN Description
-                'I': 25,  # ISP
-                'J': 12,  # Postal Code
-                'K': 15,  # Timezone
-                'L': 15,  # Data Source
-                'M': 10   # Success
-            }
-            
-            for col, width in column_widths_main.items():
-                worksheet_main.column_dimensions[col].width = width
-            
-            # Добавляем фильтры
-            worksheet_main.auto_filter.ref = worksheet_main.dimensions
-            
-            # 📈 ВКЛАДКА 2: Статистика по организациям
-            if len(main_df) > 0:
-                org_stats = main_df[main_df['organization'] != 'N/A'].groupby('organization').agg({
-                    'ip': 'count',
-                    'country': 'first',
-                    'asn': 'first'
-                }).rename(columns={'ip': 'count_ips'}).sort_values('count_ips', ascending=False)
-                
-                if not org_stats.empty:
-                    org_stats.to_excel(writer, sheet_name='По организациям')
-                    worksheet_org = writer.sheets['По организациям']
-                    worksheet_org.column_dimensions['A'].width = 35
-                    worksheet_org.column_dimensions['B'].width = 10
-                    worksheet_org.column_dimensions['C'].width = 15
-                    worksheet_org.column_dimensions['D'].width = 10
-            
-            # 🌍 ВКЛАДКА 3: Статистика по странам
-            if len(main_df) > 0:
-                country_stats = main_df[main_df['country'] != 'N/A'].groupby('country').agg({
-                    'ip': 'count',
-                    'organization': lambda x: ', '.join(sorted(set(x)))[:100]
-                }).rename(columns={'ip': 'count_ips'}).sort_values('count_ips', ascending=False)
-                
-                if not country_stats.empty:
-                    country_stats.to_excel(writer, sheet_name='По странам')
-                    worksheet_country = writer.sheets['По странам']
-                    worksheet_country.column_dimensions['A'].width = 20
-                    worksheet_country.column_dimensions['B'].width = 10
-                    worksheet_country.column_dimensions['C'].width = 40
-            
-            # 🔢 ВКЛАДКА 4: Статистика по ASN
-            if len(main_df) > 0:
-                asn_stats = main_df[main_df['asn'] != 'N/A'].groupby('asn').agg({
-                    'ip': 'count',
-                    'organization': 'first',
-                    'country': 'first'
-                }).rename(columns={'ip': 'count_ips'}).sort_values('count_ips', ascending=False)
-                
-                if not asn_stats.empty:
-                    asn_stats.to_excel(writer, sheet_name='По ASN')
-                    worksheet_asn = writer.sheets['По ASN']
-                    worksheet_asn.column_dimensions['A'].width = 15
-                    worksheet_asn.column_dimensions['B'].width = 10
-                    worksheet_asn.column_dimensions['C'].width = 35
-                    worksheet_asn.column_dimensions['D'].width = 15
-            
-            # ✅ ВКЛАДКА 5: Только успешные результаты
-            successful_df = main_df[main_df['success'] == 'Yes']
-            if not successful_df.empty:
-                successful_df.to_excel(writer, sheet_name='Успешные запросы', index=False)
-                worksheet_success = writer.sheets['Успешные запросы']
-                
-                # Копируем форматирование ширины колонок из основной вкладки
-                for col, width in column_widths_main.items():
-                    worksheet_success.column_dimensions[col].width = width
-                worksheet_success.auto_filter.ref = worksheet_success.dimensions
-            
-            # 📋 ВКЛАДКА 6: Сводка и статистика
-            summary_data = {
-                'Метрика': [
-                    'Всего обработано IP-адресов',
-                    'Успешных запросов',
-                    'Процент успешных запросов',
-                    'Уникальных организаций',
-                    'Уникальных стран',
-                    'Уникальных ASN',
-                    'Время начала',
-                    'Время окончания'
-                ],
-                'Значение': [
-                    len(main_df),
-                    len(successful_df),
-                    f"{(len(successful_df) / len(main_df) * 100):.1f}%" if len(main_df) > 0 else "0%",
-                    main_df['organization'].nunique() if len(main_df) > 0 else 0,
-                    main_df['country'].nunique() if len(main_df) > 0 else 0,
-                    main_df['asn'].nunique() if len(main_df) > 0 else 0,
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'В процессе...'
-                ]
-            }
-            
-            summary_df = pd.DataFrame(summary_data)
-            summary_df.to_excel(writer, sheet_name='Сводка', index=False)
-            worksheet_summary = writer.sheets['Сводка']
-            worksheet_summary.column_dimensions['A'].width = 30
-            worksheet_summary.column_dimensions['B'].width = 25
-            
-        print(f"✅ Единый Excel файл создан: {output_path}")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Ошибка при сохранении в Excel: {e}")
-        return False
+        addresses = read_ips_from_txt(args.input)
+        if not addresses:
+            print("Входной файл не содержит корректных IP", file=sys.stderr)
+            return 1
+        results = []
+        with requests.Session() as session:
+            for index, address in enumerate(addresses, 1):
+                result = get_comprehensive_whois_info(address, session, args.timeout, args.retries)
+                results.append(result)
+                print(f"[{index}/{len(addresses)}] {address}: {result['success']} — {result['organization']}")
+                if result["error_message"]:
+                    print(result["error_message"], file=sys.stderr)
+                if index < len(addresses):
+                    time.sleep(args.delay)
+        save_to_single_excel(results, output, started, datetime.now(timezone.utc), args.overwrite)
+        count = sum(row["success"] == "Yes" for row in results)
+        print(f"Успешно: {count}/{len(results)}. Отчёт: {output}")
+        return 0 if count == len(results) else 2
+    except (OSError, ValueError) as error:
+        print(f"Ошибка: {error}", file=sys.stderr)
+        return 1
 
-def main():
-    # Получаем путь к директории, где находится скрипт
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Имя текстового файла с IP-адресами (в той же папке что и скрипт)
-    input_txt_file = "ip_list.txt"
-    input_file_path = os.path.join(script_dir, input_txt_file)
-    
-    # Выходной Excel файл (в той же папке что и скрипт)
-    output_excel_file = os.path.join(script_dir, 'WHOIS_Analysis_Report.xlsx')
-    
-    print("🚀 WHOIS АНАЛИЗАТОР IP-АДРЕСОВ")
-    print("=====================================")
-    print(f"📂 Рабочая директория: {script_dir}")
-    print(f"📄 Входной файл: {input_txt_file}")
-    print(f"💾 Выходной файл: WHOIS_Analysis_Report.xlsx")
-    print(f"⏰ Время начала: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Проверяем существование файла
-    if not os.path.exists(input_file_path):
-        print(f"❌ Ошибка: файл {input_txt_file} не найден!")
-        print("💡 Убедитесь, что файл ip_list.txt находится в той же папке что и скрипт")
-        return
-    
-    # Читаем IP-адреса из текстового файла
-    unique_ips = read_ips_from_txt(input_file_path)
-    
-    if not unique_ips:
-        print("❌ Не удалось прочитать IP-адреса из файла")
-        return
-    
-    # Удаляем дубликаты
-    unique_ips = list(set(unique_ips))
-    print(f"🔍 Уникальных IP-адресов для обработки: {len(unique_ips)}")
-    
-    # Собираем WHOIS информацию
-    whois_results = []
-    
-    print(f"\n🔄 Начинаем сбор WHOIS информации...")
-    print("💡 Используются API: ipapi.co, ipwhois.app")
-    
-    successful_count = 0
-    failed_ips = []
-    
-    start_time = datetime.now()
-    
-    for i, ip in enumerate(unique_ips, 1):
-        print(f"\n--- [{i}/{len(unique_ips)}] Обрабатываю: {ip} ---")
-        
-        try:
-            # Получаем WHOIS информацию
-            result = get_comprehensive_whois_info(ip)
-            whois_results.append(result)
-            
-            # Проверяем успешность
-            if result['success'] == 'Yes':
-                successful_count += 1
-                status = "✅ УСПЕХ"
-            else:
-                failed_ips.append(ip)
-                status = "⚠️ ДАННЫЕ НЕ ПОЛУЧЕНЫ"
-            
-            # Выводим результаты
-            print(f"{status}")
-            print(f"🏢 Организация: {result['organization']}")
-            print(f"🌍 Страна: {result['country']}")
-            print(f"🏙️ Город: {result['city']}")
-            print(f"🔢 ASN: {result['asn']}")
-            print(f"📡 ISP: {result['isp']}")
-            
-        except Exception as e:
-            print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
-            # Добавляем запись об ошибке
-            whois_results.append({
-                'ip': ip,
-                'organization': f'ERROR: {str(e)[:50]}',
-                'country': 'N/A',
-                'city': 'N/A',
-                'region': 'N/A',
-                'netname': 'N/A',
-                'asn': 'N/A',
-                'asn_description': 'N/A',
-                'isp': 'N/A',
-                'postal_code': 'N/A',
-                'timezone': 'N/A',
-                'data_source': 'ERROR',
-                'success': 'No'
-            })
-            failed_ips.append(ip)
-        
-        # Пауза чтобы не заблокировали
-        time.sleep(1.0)
-    
-    # Сохраняем все результаты в ОДИН Excel файл
-    excel_saved = save_to_single_excel(whois_results, output_excel_file)
-    
-    end_time = datetime.now()
-    processing_time = end_time - start_time
-    
-    print(f"\n{'='*60}")
-    print("📊 РЕЗУЛЬТАТЫ АНАЛИЗА")
-    print(f"{'='*60}")
-    print(f"✅ Обработано IP-адресов: {len(whois_results)}")
-    print(f"✅ Успешно получено данных: {successful_count}/{len(whois_results)} ({successful_count/len(whois_results)*100:.1f}%)")
-    print(f"⏱️ Время обработки: {processing_time}")
-    
-    if failed_ips:
-        print(f"⚠️ Не удалось получить данные для: {len(failed_ips)} IP")
-        if len(failed_ips) <= 10:
-            print(f"   Проблемные IP: {', '.join(failed_ips[:10])}")
-    
-    print(f"⏰ Время окончания: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    if excel_saved:
-        print(f"💾 Все результаты сохранены в: WHOIS_Analysis_Report.xlsx")
 
 if __name__ == "__main__":
-    # Установите если нужно: 
-    # pip install requests pandas openpyxl
-    
-    main()
-    
-    print(f"\n{'='*60}")
-    print("🎉 АНАЛИЗ ЗАВЕРШЕН!")
-    print(f"{'='*60}")
-    
-    print(f"\n💡 Для повторного запуска выполните: py main.py")
+    sys.exit(main())
