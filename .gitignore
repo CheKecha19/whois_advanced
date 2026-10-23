@@ -3,3 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 WHOIS_Analysis_Report*.xlsx
+.whois/
+WHOIS_Analysis_Report*.json
+WHOIS_Analysis_Report*.csv
+*.jsonl
+outputs/

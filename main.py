@@ -1,227 +1,234 @@
-"""IP enrichment and Excel reporting. Run python main.py --help."""
+"""whois_advanced v1.2: resumable IP enrichment and comparison reports."""
 
 import argparse
 from datetime import datetime, timezone
-import ipaddress
+import hashlib
+import json
 import math
+import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 
-import pandas as pd
 import requests
 
-__version__ = "1.1.0"
-MISSING = "N/A"
-FIELDS = ["ip", "organization", "country", "city", "region", "netname", "asn",
-          "asn_description", "isp", "postal_code", "timezone", "data_source",
-          "success", "request_status", "error_type", "error_message"]
-PROVIDERS = (
-    ("ipapi.co", "https://ipapi.co/{ip}/json/", {"organization": "org", "country": "country_name"}),
-    ("ipwhois.app", "https://ipwhois.app/json/{ip}", {"organization": "org", "country": "country"}),
-)
+from providers import LookupClient, PROVIDERS
+from reporting import (build_summary, compare_records, load_report, read_input,
+                       save_to_single_excel, write_report)
+from storage import StateStore
+from console import Progress
+
+__version__ = "1.2.0"
 
 
-def read_ips_from_txt(file_path):
-    """Canonicalize IPv4/IPv6, ignore comments, preserve first-seen order."""
-    addresses = {}
-    with open(file_path, encoding="utf-8-sig") as source:
-        for number, line in enumerate(source, 1):
-            value = line.split("#", 1)[0].strip()
-            if not value:
-                continue
-            try:
-                address = ipaddress.ip_address(value)
-                if "%" in value:
-                    raise ValueError("Scoped IPv6 is not supported")
-                addresses[str(address)] = None
-            except ValueError:
-                print(f"Строка {number}: неверный IP {value!r}", file=sys.stderr)
-    return list(addresses)
+def read_ips_from_txt(path):
+    addresses, _, errors = read_input(path)
+    for error in errors:
+        print(f"Строка {error['line']}: неверный IP {error['value']!r}", file=sys.stderr)
+    return addresses
 
 
-def clean(value):
-    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-        return MISSING
-    value = " ".join(str(value).split())
-    return MISSING if value.lower() in ("", "none", "null", "n/a") else value
+def get_comprehensive_whois_info(ip_address, session=None, timeout=10, retries=2):
+    """For batch operations reuse LookupClient to preserve provider cooldowns."""
+    if session is None:
+        with requests.Session() as session:
+            return LookupClient(session, timeout, retries).lookup(ip_address)
+    return LookupClient(session, timeout, retries).lookup(ip_address)
 
 
-def get_comprehensive_whois_info(ip_address, session=None, timeout=10, retries=2, backoff=1):
-    """Try providers in order; retry transient failures with bounded backoff."""
-    address = ipaddress.ip_address(ip_address)
-    result = dict.fromkeys(FIELDS, MISSING)
-    result.update(ip=str(address), success="No", request_status="failed",
-                  error_type="no_data", error_message="", data_source=MISSING)
-    if not address.is_global or address.is_multicast:
-        result.update(request_status="skipped", error_type="non_public_ip",
-                      error_message="Для локального/служебного IP публичные API не вызываются")
-        return result
-    owned = session is None
-    session = session or requests.Session()
-    errors = []
-    try:
-        for host, template, mapping in PROVIDERS:
-            for attempt in range(retries + 1):
-                retryable, retry_after = False, None
-                status_label = "failed"
-                try:
-                    with session.get(template.format(ip=address), timeout=timeout) as response:
-                        status = response.status_code
-                        status_label = f"HTTP {status}"
-                        if status != 200:
-                            kind, message = f"http_{status}", status_label
-                            retryable = status == 429 or status in (500, 502, 503, 504)
-                            try:
-                                seconds = float(response.headers.get("Retry-After", "nan"))
-                                if math.isfinite(seconds):
-                                    retry_after = min(60, max(0, seconds))
-                            except ValueError:
-                                pass
-                        else:
-                            data = response.json()
-                            if not isinstance(data, dict) or not data:
-                                kind, message = "invalid_response", "Ожидался непустой JSON-объект"
-                            elif data.get("error") or data.get("reserved") or data.get("success") is False:
-                                kind, message = "api_error", clean(data.get("reason") or data.get("message") or "API отклонил запрос")
-                            else:
-                                parsed = {field: clean(data.get(mapping.get(field, field)))
-                                          for field in ("organization", "country", "city", "region", "asn", "isp", "timezone")}
-                                parsed["postal_code"] = clean(data.get("postal"))
-                                if any(parsed[k] != MISSING for k in ("organization", "country", "asn", "isp")):
-                                    result.update(parsed)
-                                    result.update(success="Yes", request_status="HTTP 200", data_source=host,
-                                                  error_type="", error_message="; ".join(errors))
-                                    return result
-                                kind, message = "no_data", "Ответ не содержит сетевых или географических данных"
-                except requests.Timeout:
-                    kind, message, retryable = "timeout", "Превышен таймаут", True
-                except requests.ConnectionError:
-                    kind, message, retryable = "connection_error", "Ошибка соединения/прокси/TLS", True
-                except ValueError:
-                    kind, message = "invalid_json", "Некорректный JSON"
-                except requests.RequestException as error:
-                    kind, message = "request_error", type(error).__name__
-                errors.append(f"{host} (попытка {attempt + 1}): {message}")
-                result.update(error_type=kind, request_status=status_label if kind.startswith("http_") else kind)
-                if not retryable or attempt == retries:
-                    break
-                time.sleep(retry_after if retry_after is not None else min(backoff * 2 ** attempt, 60))
-        result["error_message"] = "; ".join(errors)
-        return result
-    finally:
-        if owned:
-            session.close()
+def number(value, minimum=0):
+    result = float(value)
+    if not math.isfinite(result) or result < minimum:
+        raise argparse.ArgumentTypeError(f"ожидалось конечное число >= {minimum}")
+    return result
 
 
-def excel_text(value):
-    """Keep external values as text rather than executable spreadsheet formulas."""
-    if isinstance(value, str):
-        value = "".join(c for c in value if ord(c) >= 32 or c in "\n\r\t")
-        return "'" + value if value.startswith(("=", "+", "-", "@")) else value
-    return value
+def positive(value):
+    result = number(value)
+    if result == 0:
+        raise argparse.ArgumentTypeError("ожидалось число > 0")
+    return result
 
 
-def save_to_single_excel(whois_results, output_path, started_at=None, ended_at=None, overwrite=False):
-    """Always write six sheets, with real timing and unknowns excluded from counts."""
-    started_at = started_at or datetime.now(timezone.utc)
-    ended_at = ended_at or datetime.now(timezone.utc)
-    frame = pd.DataFrame(whois_results, columns=FIELDS).fillna(MISSING)
-    successful = frame[frame["success"] == "Yes"]
-    sheets = {"Все IP-адреса": frame}
-    for name, key in (("По организациям", "organization"), ("По странам", "country"), ("По ASN", "asn")):
-        valid = frame[frame[key] != MISSING]
-        aggregations = {"ip": "count"}
-        for column in ("organization", "country", "asn"):
-            if column != key:
-                aggregations[column] = lambda values: ", ".join(dict.fromkeys(v for v in values if v != MISSING))
-        sheets[name] = (valid.groupby(key, sort=False).agg(aggregations)
-                        .rename(columns={"ip": "count_ips"}).reset_index()
-                        .sort_values("count_ips", ascending=False))
-    sheets["Успешные запросы"] = successful
-    sheets["Сводка"] = pd.DataFrame({
-        "Метрика": ["Всего обработано IP-адресов", "Успешных запросов", "Процент успешных запросов",
-                    "Уникальных организаций", "Уникальных стран", "Уникальных ASN",
-                    "Время начала (UTC)", "Время окончания (UTC)", "Длительность (сек.)"],
-        "Значение": [len(frame), len(successful), f"{len(successful) / len(frame) * 100:.1f}%" if len(frame) else "0.0%",
-                     *[frame.loc[frame[k] != MISSING, k].nunique() for k in ("organization", "country", "asn")],
-                     started_at.isoformat(), ended_at.isoformat(), (ended_at - started_at).total_seconds()],
-    })
-    with open(output_path, "wb" if overwrite else "xb") as target:
-        with pd.ExcelWriter(target, engine="openpyxl") as writer:
-            for name, data in sheets.items():
-                data.map(excel_text).to_excel(writer, sheet_name=name, index=False)
-                sheet = writer.sheets[name]
-                sheet.freeze_panes = "A2"
-                sheet.auto_filter.ref = sheet.dimensions
-                for column in sheet.columns:
-                    width = min(65, max(15, max(len(str(c.value or "")) for c in column) + 2))
-                    sheet.column_dimensions[column[0].column_letter].width = width
-    return True
-
-
-def positive_float(value):
-    number = float(value)
-    if not math.isfinite(number) or number <= 0:
-        raise argparse.ArgumentTypeError("ожидалось конечное число > 0")
-    return number
-
-
-def nonnegative_float(value):
-    number = float(value)
-    if not math.isfinite(number) or number < 0:
-        raise argparse.ArgumentTypeError("ожидалось конечное число >= 0")
-    return number
-
-
-def nonnegative_int(value):
-    number = int(value)
-    if number < 0:
+def integer(value):
+    result = int(value)
+    if result < 0:
         raise argparse.ArgumentTypeError("ожидалось целое число >= 0")
-    return number
+    return result
+
+
+def fingerprint(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def reusable(row, rdap):
+    return row and (row["request_status"] == "skipped" or
+                    (row["success"] == "Yes" and (not rdap or row["rdap_status"] == "success")))
+
+
+def parser_for_cli():
+    parser = argparse.ArgumentParser(description="IPv4/IPv6: API, RDAP, кэш, возобновление и отчёты")
+    parser.add_argument("--version", action="version", version=__version__)
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--input", type=Path, help="UTF-8-файл IP (по умолчанию ip_list.txt рядом со скриптом)")
+    inputs.add_argument("--retry-failed", type=Path, help="Повторить ошибки из JSON/CSV/XLSX-отчёта")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--format", choices=("xlsx", "csv", "json"))
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--timeout", type=positive, default=10)
+    parser.add_argument("--delay", type=number, default=1)
+    parser.add_argument("--retries", type=integer, default=2)
+    parser.add_argument("--providers", nargs="+", choices=tuple(PROVIDERS), default=list(PROVIDERS))
+    parser.add_argument("--rdap", action="store_true", help="Дополнить регистрационными данными RDAP")
+    parser.add_argument("--batch", choices=("auto", "off", "on"), default="auto",
+                        help="IPWHOIS Pro bulk: auto использует IPWHOIS_API_KEY, on требует ключ")
+    parser.add_argument("--batch-size", type=integer, default=100, help="Адресов в пакете, 1–100")
+    parser.add_argument("--state-dir", type=Path, default=Path(__file__).resolve().parent / ".whois")
+    parser.add_argument("--resume", action="store_true", help="Продолжить тот же список и настройки источников")
+    parser.add_argument("--cache-ttl", type=number, default=86400, help="Срок кэша в секундах; по умолчанию сутки")
+    parser.add_argument("--no-cache", action="store_true", help="Не читать и не записывать кэш")
+    parser.add_argument("--refresh", action="store_true", help="Не читать кэш, но обновить его")
+    parser.add_argument("--compare", type=Path, help="Сравнить результат с предыдущим JSON/CSV/XLSX")
+    parser.add_argument("--log", type=Path, help="Машинный журнал JSONL (создаётся до начала запросов)")
+    parser.add_argument("--quiet", action="store_true", help="Не показывать прогресс каждого адреса")
+    parser.add_argument("--verbose", action="store_true", help="Подробные результаты и ошибки каждого IP")
+    return parser
+
+
+def same_path(left, right):
+    return left.resolve() == right.resolve() or (left.exists() and right.exists() and left.samefile(right))
+
+
+def preflight(args, output, inputs):
+    destinations = [output] + ([args.log] if args.log else [])
+    for index, destination in enumerate(destinations):
+        if destination.exists() and (not args.overwrite or destination.is_dir()):
+            raise ValueError(f"Файл уже существует: {destination}; используйте --overwrite")
+        if not destination.parent.is_dir():
+            raise ValueError(f"Нет выходного каталога: {destination.parent}")
+        if any(same_path(destination, source) for source in inputs):
+            raise ValueError("Выходной файл не должен совпадать с входным отчётом или списком")
+        if any(same_path(destination, other) for other in destinations[:index]):
+            raise ValueError("Отчёт и журнал должны иметь разные пути")
+        if destination.resolve().is_relative_to(args.state_dir.resolve()):
+            raise ValueError("Отчёты и журналы нужно сохранять вне служебного --state-dir")
 
 
 def main(argv=None):
+    args = parser_for_cli().parse_args(argv)
     directory = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="Сбор данных о публичных IPv4/IPv6 и экспорт в Excel")
-    parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument("--input", type=Path, default=directory / "ip_list.txt")
-    parser.add_argument("--output", type=Path, help="Путь к Excel-отчёту (по умолчанию — имя с UTC-временем)")
-    parser.add_argument("--overwrite", action="store_true", help="Разрешить замену существующего отчёта")
-    parser.add_argument("--timeout", type=positive_float, default=10)
-    parser.add_argument("--delay", type=nonnegative_float, default=1)
-    parser.add_argument("--retries", type=nonnegative_int, default=2, help="Повторы после первого запроса")
-    args = parser.parse_args(argv)
     started = datetime.now(timezone.utc)
-    output = args.output or directory / f"WHOIS_Analysis_Report_{started:%Y%m%d_%H%M%S_%f}.xlsx"
-    if output.resolve() == args.input.resolve():
-        print("Входной файл и отчёт должны иметь разные пути", file=sys.stderr)
-        return 1
-    if output.exists() and not args.overwrite:
-        print(f"Отчёт уже существует: {output}. Выберите другое имя или --overwrite", file=sys.stderr)
-        return 1
+    format = args.format or (args.output.suffix.lower().lstrip(".") if args.output else "xlsx")
+    output = args.output or directory / f"WHOIS_Analysis_Report_{started:%Y%m%d_%H%M%S_%f}.{format}"
+    source = args.retry_failed or args.input or directory / "ip_list.txt"
+    store = log = None
+    results, interrupted = [], False
     try:
-        addresses = read_ips_from_txt(args.input)
-        if not addresses:
-            print("Входной файл не содержит корректных IP", file=sys.stderr)
-            return 1
-        results = []
-        with requests.Session() as session:
-            for index, address in enumerate(addresses, 1):
-                result = get_comprehensive_whois_info(address, session, args.timeout, args.retries)
-                results.append(result)
-                print(f"[{index}/{len(addresses)}] {address}: {result['success']} — {result['organization']}")
-                if result["error_message"]:
-                    print(result["error_message"], file=sys.stderr)
-                if index < len(addresses):
-                    time.sleep(args.delay)
-        save_to_single_excel(results, output, started, datetime.now(timezone.utc), args.overwrite)
-        count = sum(row["success"] == "Yes" for row in results)
-        print(f"Успешно: {count}/{len(results)}. Отчёт: {output}")
-        return 0 if count == len(results) else 2
-    except (OSError, ValueError) as error:
+        if format not in ("xlsx", "csv", "json") or output.suffix.lower() != f".{format}":
+            raise ValueError("Расширение отчёта должно соответствовать --format: xlsx, csv или json")
+        if format == "csv" and args.compare and not args.log:
+            raise ValueError("Для сравнения при CSV укажите --log changes.jsonl либо выберите JSON/XLSX")
+        if args.resume and args.refresh:
+            raise ValueError("--resume и --refresh несовместимы: выберите продолжение или обновление")
+        if not 1 <= args.batch_size <= 100:
+            raise ValueError("--batch-size должен быть от 1 до 100")
+        bulk_key = os.environ.get("IPWHOIS_API_KEY") if args.batch != "off" else None
+        if args.batch == "on" and not bulk_key:
+            raise ValueError("Пакетному API нужен ключ IPWHOIS_API_KEY в переменных окружения; --batch off работает без ключа")
+        preflight(args, output, [source] + ([args.compare] if args.compare else []))
+        previous = load_report(args.compare) if args.compare else None
+        if args.retry_failed:
+            rows = load_report(args.retry_failed)
+            addresses = [r["ip"] for r in rows if r.get("request_status") != "skipped" and
+                         (r["success"] != "Yes" or r.get("rdap_status") == "failed")]
+            stats = dict(lines=len(rows), candidates=len(addresses), valid=len(addresses), duplicates=0, rejected=0)
+            errors = []
+            if any(r.get("rdap_status") == "failed" for r in rows):
+                args.rdap = True
+        else:
+            addresses, stats, errors = read_input(source)
+        if not addresses and not errors:
+            print("Нет адресов для обработки: вход пуст или повторять нечего.")
+            return 0 if args.retry_failed else 1
+        if args.verbose and not args.quiet:
+            for error in errors:
+                print(f"Строка {error['line']}: неверный IP {error['value']!r}", file=sys.stderr)
+        configuration = dict(schema=2, providers=list(dict.fromkeys(args.providers)), rdap=args.rdap, bulk=bool(bulk_key))
+        run_key = fingerprint(dict(configuration, addresses=addresses))
+        store = StateStore(args.state_dir)
+        if args.log:
+            log = args.log.open("w" if args.overwrite else "x", encoding="utf-8")
+
+        def emit(kind, payload):
+            if log:
+                log.write(json.dumps(dict(type=kind, at=datetime.now(timezone.utc).isoformat(),
+                                          **payload), ensure_ascii=False, allow_nan=False) + "\n")
+                log.flush()
+
+        emit("start", dict(version=__version__, run_key=run_key, input_stats=stats, input_errors=errors))
+        clock = time.monotonic()
+        progress = Progress(len(addresses), args.quiet, args.verbose)
+        client = None
+        try:
+            with requests.Session() as session:
+                session.headers["User-Agent"] = "whois_advanced/1.2"
+                client = LookupClient(session, args.timeout, args.retries, configuration["providers"], args.rdap, bulk_key)
+                for offset in range(0, len(addresses), args.batch_size):
+                    pending = []
+                    for address in addresses[offset:offset + args.batch_size]:
+                        cache_key = fingerprint(dict(configuration, ip=address))
+                        result = store.checkpoint(run_key, address) if args.resume else None
+                        if reusable(result, args.rdap):
+                            result.update(resumed=True, cache_hit=False)
+                        else:
+                            result = None
+                        if result is None and not (args.no_cache or args.refresh or args.retry_failed):
+                            result = store.cached(cache_key, args.cache_ttl)
+                            if result is not None:
+                                result.update(cache_hit=True, resumed=False)
+                        pending.append((address, cache_key, result))
+                    if bulk_key:
+                        client.prepare_batch([address for address, _, result in pending if result is None])
+                    for address, cache_key, result in pending:
+                        fresh = result is None
+                        if fresh:
+                            result = client.lookup(address)
+                        store.save(run_key, cache_key, result,
+                                   cacheable=fresh and not args.no_cache and result["success"] == "Yes" and reusable(result, args.rdap))
+                        results.append(result)
+                        emit("result", dict(record=result))
+                        progress.update(result)
+                        if len(results) < len(addresses) and fresh and "ipwhois-pro" not in result["source_details"]:
+                            time.sleep(args.delay)
+                    if bulk_key and offset + args.batch_size < len(addresses):
+                        time.sleep(args.delay)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("Прервано: сохраняю обработанные адреса. Продолжение: --resume с тем же списком.", file=sys.stderr)
+        finally:
+            progress.close()
+        summary = build_summary(results, stats, started, datetime.now(timezone.utc), interrupted)
+        summary.update(http_requests=client.request_count if client else 0, batch_enabled=bool(bulk_key))
+        changes = compare_records(previous, results, addresses) if previous is not None else None
+        write_report(output, results, summary, errors, changes, args.overwrite, format)
+        emit("summary", dict(summary=summary, changes=changes or [], output=str(output)))
+        print(f"Обработано {len(results)}/{len(addresses)} | успешно {summary['successful']} | "
+              f"ошибок {summary['failed']} | пропущено {summary['skipped']} | неверных строк {stats['rejected']}")
+        print(f"Кэш {summary['cached']} | продолжено {summary['resumed']} | "
+              f"HTTP {summary['http_requests']} | RDAP-ошибок {summary['rdap_failed']} | {time.monotonic() - clock:.1f} сек.")
+        print(f"Отчёт: {output}")
+        if interrupted:
+            return 130
+        return 2 if stats["rejected"] or summary["failed"] or summary["skipped"] or summary["rdap_failed"] else 0
+    except (OSError, ValueError, sqlite3.Error) as error:
         print(f"Ошибка: {error}", file=sys.stderr)
         return 1
+    finally:
+        if log:
+            log.close()
+        if store:
+            store.close()
 
 
 if __name__ == "__main__":
